@@ -19,6 +19,11 @@
 			}
 		]
 	},
+	"secrets": {
+		"required": [
+			"TOKEN_SECRET"
+		]
+	},
 	"vars": {
 		"PUBLIC_BASE_DOMAIN": "hostc.dev"
 	},

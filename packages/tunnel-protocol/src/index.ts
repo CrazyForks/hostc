@@ -1,18 +1,18 @@
-export const TUNNEL_CONNECT_PATH = "/_hostc/tunnel";
 export const TUNNELS_API_PATH = "/api/tunnels";
 
 export type HeaderEntry = [name: string, value: string];
-
-export type CreateTunnelRequest = {
-  subdomain?: string;
-};
 
 export type CreateTunnelResponse = {
   tunnelId: string;
   subdomain: string;
   publicUrl: string;
   websocketUrl: string;
-  connectToken: string;
+  sessionToken: string;
+};
+
+export type RefreshTunnelSessionResponse = {
+  websocketUrl: string;
+  sessionToken: string;
 };
 
 export type TunnelReadyMessage = {
@@ -108,6 +108,10 @@ export function buildTunnelConnectPath(tunnelId: string): string {
   return `${TUNNELS_API_PATH}/${encodeURIComponent(tunnelId)}/connect`;
 }
 
+export function buildTunnelRefreshPath(tunnelId: string): string {
+  return `${TUNNELS_API_PATH}/${encodeURIComponent(tunnelId)}/refresh`;
+}
+
 export function parseCreateTunnelResponse(raw: string): CreateTunnelResponse | null {
   const parsed = parseJsonRecord(raw);
 
@@ -116,6 +120,16 @@ export function parseCreateTunnelResponse(raw: string): CreateTunnelResponse | n
   }
 
   return isCreateTunnelResponse(parsed) ? parsed : null;
+}
+
+export function parseRefreshTunnelSessionResponse(raw: string): RefreshTunnelSessionResponse | null {
+  const parsed = parseJsonRecord(raw);
+
+  if (!parsed) {
+    return null;
+  }
+
+  return isRefreshTunnelSessionResponse(parsed) ? parsed : null;
 }
 
 export function parseTunnelClientMessage(raw: string): TunnelClientMessage | null {
@@ -199,8 +213,12 @@ function isCreateTunnelResponse(value: JsonRecord): value is CreateTunnelRespons
     isString(value.subdomain) &&
     isString(value.publicUrl) &&
     isString(value.websocketUrl) &&
-    isString(value.connectToken)
+    isString(value.sessionToken)
   );
+}
+
+function isRefreshTunnelSessionResponse(value: JsonRecord): value is RefreshTunnelSessionResponse {
+  return isString(value.websocketUrl) && isString(value.sessionToken);
 }
 
 function isHeaderEntries(value: unknown): value is HeaderEntry[] {

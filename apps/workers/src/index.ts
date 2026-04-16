@@ -1,163 +1,180 @@
-import { Hono, type Context } from "hono";
 import {
   buildPublicUrl,
+  type CreateTunnelResponse,
+  type RefreshTunnelSessionResponse,
   normalizeSubdomain,
   TUNNELS_API_PATH,
-  type CreateTunnelRequest,
-  type CreateTunnelResponse,
 } from "@hostc/tunnel-protocol";
 import { HostcDurableObject } from "./durable/tunnel";
-import { buildTunnelWebSocketUrl, createRandomTunnelId, extractTunnelSubdomain } from "./lib/tunnels";
+import { createConnectToken, verifyConnectToken } from "./lib/connect-token";
+import { createSessionToken, verifySessionToken } from "./lib/session-token";
+import { buildTunnelWebSocketUrl, createRandomSubdomain, extractTunnelSubdomain } from "./lib/tunnels";
 
-type AppEnv = {
-  Bindings: Env;
-};
-
-type InternalCreateTunnelResponse = {
-  tunnelId: string;
-  subdomain: string;
-  connectToken: string;
-};
-
-const INTERNAL_CREATE_PATH = "/_internal/create";
 const INTERNAL_CONNECT_PATH = "/_internal/connect";
+const CONNECT_ROUTE_SUFFIX = "/connect";
+const REFRESH_ROUTE_SUFFIX = "/refresh";
 
-const app = new Hono<AppEnv>();
+const worker: ExportedHandler<Env> = {
+  async fetch(request, env): Promise<Response> {
+    try {
+      return await handleRequest(request, env);
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          event: "worker.unhandled_error",
+          error: asErrorMessage(error),
+          path: new URL(request.url).pathname,
+        }),
+      );
 
-app.onError((error, c) => {
-  console.error(
-    JSON.stringify({
-      event: "worker.unhandled_error",
-      error: error.message,
-      path: new URL(c.req.url).pathname,
-    }),
-  );
-
-  return c.json(
-    {
-      error: "Internal server error",
-    },
-    500,
-  );
-});
-
-app.post(TUNNELS_API_PATH, async (c) => {
-  const body = await readCreateTunnelRequest(c.req.raw);
-
-  if (body.subdomain !== undefined && !normalizeSubdomain(body.subdomain)) {
-    return c.json(
-      {
-        error: "Invalid subdomain",
-      },
-      400,
-    );
-  }
-
-  const subdomain = normalizeSubdomain(body.subdomain ?? "") ?? createRandomTunnelId();
-  const tunnelId = subdomain;
-  const tunnelStub = c.env.HOSTC_DURABLE_OBJECT.getByName(tunnelId);
-
-  const createResponse = await tunnelStub.fetch(
-    new Request(`https://hostc.internal${INTERNAL_CREATE_PATH}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        tunnelId,
-        subdomain,
-      }),
-    }),
-  );
-
-  if (!createResponse.ok) {
-    return cloneResponse(createResponse);
-  }
-
-  const created = (await createResponse.json()) as InternalCreateTunnelResponse;
-  const requestUrl = new URL(c.req.url);
-
-  return c.json<CreateTunnelResponse>(
-    {
-      tunnelId: created.tunnelId,
-      subdomain: created.subdomain,
-      publicUrl: buildPublicUrl(c.env.PUBLIC_BASE_DOMAIN, created.subdomain),
-      websocketUrl: buildTunnelWebSocketUrl(requestUrl, created.tunnelId, created.connectToken),
-      connectToken: created.connectToken,
-    },
-    201,
-  );
-});
-
-app.get(`${TUNNELS_API_PATH}/:tunnelId/connect`, async (c) => {
-  const tunnelId = normalizeSubdomain(c.req.param("tunnelId"));
-
-  if (!tunnelId) {
-    return c.json(
-      {
-        error: "Invalid tunnel id",
-      },
-      400,
-    );
-  }
-
-  const requestUrl = new URL(c.req.url);
-  const tunnelStub = c.env.HOSTC_DURABLE_OBJECT.getByName(tunnelId);
-
-  return tunnelStub.fetch(new Request(`https://hostc.internal${INTERNAL_CONNECT_PATH}${requestUrl.search}`, c.req.raw));
-});
-
-app.get("/", (c) => {
-  const tunnelSubdomain = getTunnelSubdomain(c);
-
-  if (tunnelSubdomain) {
-    return proxyTunnelRequest(c, tunnelSubdomain);
-  }
-
-  return createInfoResponse(c.env.PUBLIC_BASE_DOMAIN);
-});
-
-app.all("*", async (c) => {
-  const tunnelSubdomain = getTunnelSubdomain(c);
-
-  if (!tunnelSubdomain) {
-    return new Response("Not Found", {
-      status: 404,
-    });
-  }
-
-  return proxyTunnelRequest(c, tunnelSubdomain);
-});
+      return jsonError("Internal server error", 500);
+    }
+  },
+};
 
 export { HostcDurableObject };
-export default app;
+export default worker;
 
-async function readCreateTunnelRequest(request: Request): Promise<CreateTunnelRequest> {
-  const contentType = request.headers.get("content-type") ?? "";
+async function handleRequest(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
 
-  if (!contentType.includes("application/json")) {
-    return {};
+  if (request.method === "POST" && url.pathname === TUNNELS_API_PATH) {
+    return createTunnel(env, url);
   }
 
-  return (await request.json<CreateTunnelRequest>().catch(() => ({}))) ?? {};
-}
+  const refreshTunnelId = matchTunnelRouteId(url.pathname, REFRESH_ROUTE_SUFFIX);
 
-function cloneResponse(response: Response): Response {
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
+  if (request.method === "POST" && refreshTunnelId) {
+    return refreshTunnelSession(request, env, refreshTunnelId, url);
+  }
+
+  const tunnelId = matchTunnelRouteId(url.pathname, CONNECT_ROUTE_SUFFIX);
+
+  if (request.method === "GET" && tunnelId) {
+    return connectTunnel(request, env, tunnelId, url.search);
+  }
+
+  const tunnelSubdomain = extractTunnelSubdomain(url.hostname, env.PUBLIC_BASE_DOMAIN);
+
+  if (tunnelSubdomain) {
+    return proxyTunnelRequest(request, env, tunnelSubdomain);
+  }
+
+  if (request.method === "GET" && url.pathname === "/") {
+    return createInfoResponse(env.PUBLIC_BASE_DOMAIN);
+  }
+
+  return new Response("Not Found", {
+    status: 404,
   });
 }
 
-function getTunnelSubdomain(c: Context<AppEnv>): string | null {
-  const url = new URL(c.req.url);
-  return extractTunnelSubdomain(url.hostname, c.env.PUBLIC_BASE_DOMAIN);
+async function createTunnel(env: Env, requestUrl: URL): Promise<Response> {
+  const subdomain = createRandomSubdomain();
+  const [connectToken, sessionToken] = await Promise.all([
+    createConnectToken(env.TOKEN_SECRET, subdomain),
+    createSessionToken(env.TOKEN_SECRET, subdomain),
+  ]);
+  const response: CreateTunnelResponse = {
+    tunnelId: subdomain,
+    subdomain,
+    publicUrl: buildPublicUrl(env.PUBLIC_BASE_DOMAIN, subdomain),
+    websocketUrl: buildTunnelWebSocketUrl(requestUrl, subdomain, connectToken),
+    sessionToken,
+  };
+
+  return Response.json(
+    response,
+    { status: 201 },
+  );
 }
 
-function proxyTunnelRequest(c: Context<AppEnv>, tunnelSubdomain: string): Promise<Response> {
-  const tunnelStub = c.env.HOSTC_DURABLE_OBJECT.getByName(tunnelSubdomain);
-  return tunnelStub.fetch(c.req.raw);
+async function refreshTunnelSession(
+  request: Request,
+  env: Env,
+  tunnelId: string,
+  requestUrl: URL,
+): Promise<Response> {
+  const subdomain = normalizeSubdomain(tunnelId);
+
+  if (!subdomain) {
+    return jsonError("Invalid tunnel id", 400);
+  }
+
+  const sessionToken = getBearerToken(request);
+
+  if (!(await verifySessionToken(env.TOKEN_SECRET, subdomain, sessionToken))) {
+    return jsonError("Invalid session token", 403);
+  }
+
+  const [connectToken, refreshedSessionToken] = await Promise.all([
+    createConnectToken(env.TOKEN_SECRET, subdomain),
+    createSessionToken(env.TOKEN_SECRET, subdomain),
+  ]);
+  const response: RefreshTunnelSessionResponse = {
+    websocketUrl: buildTunnelWebSocketUrl(requestUrl, subdomain, connectToken),
+    sessionToken: refreshedSessionToken,
+  };
+
+  return Response.json(response);
+}
+
+async function connectTunnel(
+  request: Request,
+  env: Env,
+  tunnelId: string,
+  search: string,
+): Promise<Response> {
+  const subdomain = normalizeSubdomain(tunnelId);
+
+  if (!subdomain) {
+    return jsonError("Invalid tunnel id", 400);
+  }
+
+  const connectToken = new URL(`https://hostc.internal${search}`).searchParams.get("token") ?? "";
+
+  if (!(await verifyConnectToken(env.TOKEN_SECRET, subdomain, connectToken))) {
+    return jsonError("Invalid connect token", 403);
+  }
+
+  const tunnelStub = env.HOSTC_DURABLE_OBJECT.getByName(subdomain);
+  return tunnelStub.fetch(new Request(`https://hostc.internal${INTERNAL_CONNECT_PATH}`, request));
+}
+
+function matchTunnelRouteId(pathname: string, suffix: string): string | null {
+  const prefix = `${TUNNELS_API_PATH}/`;
+
+  if (!pathname.startsWith(prefix) || !pathname.endsWith(suffix)) {
+    return null;
+  }
+
+  const tunnelId = pathname.slice(prefix.length, -suffix.length);
+
+  if (!tunnelId || tunnelId.includes("/")) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(tunnelId);
+  } catch {
+    return null;
+  }
+}
+
+function getBearerToken(request: Request): string {
+  const authorization = request.headers.get("authorization") ?? "";
+  const [scheme, token, ...rest] = authorization.trim().split(/\s+/);
+
+  if (scheme?.toLowerCase() !== "bearer" || !token || rest.length > 0) {
+    return "";
+  }
+
+  return token;
+}
+
+function proxyTunnelRequest(request: Request, env: Env, tunnelSubdomain: string): Promise<Response> {
+  const tunnelStub = env.HOSTC_DURABLE_OBJECT.getByName(tunnelSubdomain);
+  return tunnelStub.fetch(request);
 }
 
 function createInfoResponse(publicBaseDomain: string): Response {
@@ -167,4 +184,21 @@ function createInfoResponse(publicBaseDomain: string): Response {
     publicBaseDomain,
     message: `Create a tunnel and route public traffic through subdomain.${publicBaseDomain}`,
   });
+}
+
+function jsonError(message: string, status: number): Response {
+  return Response.json(
+    {
+      error: message,
+    },
+    { status },
+  );
+}
+
+function asErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return typeof error === "string" ? error : "Unknown error";
 }

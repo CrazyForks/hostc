@@ -1,5 +1,4 @@
 import { Buffer } from "node:buffer";
-import { timingSafeEqual } from "node:crypto";
 import { DurableObject } from "cloudflare:workers";
 import {
   buildPublicUrl,
@@ -22,10 +21,8 @@ const HOP_BY_HOP_HEADERS = new Set([
   "host",
 ]);
 
-const INTERNAL_CREATE_PATH = "/_internal/create";
 const INTERNAL_CONNECT_PATH = "/_internal/connect";
 const REQUEST_START_TIMEOUT_MS = 30_000;
-const TUNNEL_METADATA_KEY = "tunnel_metadata";
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -39,33 +36,18 @@ type PendingResponse = {
   started: boolean;
 };
 
-type TunnelMetadata = {
-  tunnelId: string;
-  subdomain: string;
-  connectToken: string;
-};
-
-type CreateTunnelPayload = {
-  tunnelId: string;
-  subdomain: string;
-};
-
 export class HostcDurableObject extends DurableObject<Env> {
   private readonly pendingResponses = new Map<string, PendingResponse>();
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === INTERNAL_CREATE_PATH && request.method === "POST") {
-      return this.handleCreateTunnel(request);
-    }
-
     if (url.pathname === INTERNAL_CONNECT_PATH) {
       if (!isWebSocketUpgrade(request)) {
         return jsonError("Expected a WebSocket upgrade request", 426);
       }
 
-      return this.handleTunnelConnection(request);
+      return this.handleTunnelConnection();
     }
 
     return this.handleProxyRequest(request);
@@ -105,50 +87,15 @@ export class HostcDurableObject extends DurableObject<Env> {
     this.failPendingResponses(new Error("Tunnel connection errored"));
   }
 
-  private async handleCreateTunnel(request: Request): Promise<Response> {
-    const payload = await request.json<unknown>().catch(() => null);
-
-    if (!isCreateTunnelPayload(payload)) {
-      return jsonError("A valid tunnelId and subdomain are required", 400);
-    }
-
-    const metadata: TunnelMetadata = {
-      tunnelId: payload.tunnelId,
-      subdomain: payload.subdomain,
-      connectToken: generateConnectToken(),
-    };
-
-    await this.ctx.storage.put(TUNNEL_METADATA_KEY, metadata);
-    logInfo("tunnel.created", {
-      tunnelId: metadata.tunnelId,
-      subdomain: metadata.subdomain,
-    });
-
-    return Response.json(metadata);
-  }
-
-  private async handleTunnelConnection(request: Request): Promise<Response> {
-    const metadata = await this.getTunnelMetadata();
-
-    if (!metadata) {
-      return jsonError("Tunnel has not been created", 404);
-    }
-
-    const connectToken = new URL(request.url).searchParams.get("token") ?? "";
-
-    if (!(await tokensMatch(connectToken, metadata.connectToken))) {
-      logError("tunnel.invalid_connect_token", {
-        tunnelId: metadata.tunnelId,
-      });
-      return jsonError("Invalid connect token", 403);
-    }
+  private handleTunnelConnection(): Response {
+    const subdomain = this.getTunnelSubdomain();
 
     const { 0: clientSocket, 1: serverSocket } = new WebSocketPair();
     const existingConnections = this.ctx.getWebSockets("client").length;
 
     if (existingConnections > 0) {
       logInfo("tunnel.replaced", {
-        tunnelId: metadata.tunnelId,
+        subdomain,
         previousConnectionCount: existingConnections,
       });
     }
@@ -157,15 +104,14 @@ export class HostcDurableObject extends DurableObject<Env> {
     this.ctx.acceptWebSocket(serverSocket, ["client"]);
 
     logInfo("tunnel.connected", {
-      tunnelId: metadata.tunnelId,
-      subdomain: metadata.subdomain,
+      subdomain,
       publicBaseDomain: this.env.PUBLIC_BASE_DOMAIN,
     });
 
     this.sendMessage(serverSocket, {
       type: "tunnel-ready",
-      subdomain: metadata.subdomain,
-      publicUrl: buildPublicUrl(this.env.PUBLIC_BASE_DOMAIN, metadata.subdomain),
+      subdomain,
+      publicUrl: buildPublicUrl(this.env.PUBLIC_BASE_DOMAIN, subdomain),
     });
 
     return new Response(null, {
@@ -346,10 +292,6 @@ export class HostcDurableObject extends DurableObject<Env> {
     }
   }
 
-  private async getTunnelMetadata(): Promise<TunnelMetadata | null> {
-    return (await this.ctx.storage.get<TunnelMetadata>(TUNNEL_METADATA_KEY)) ?? null;
-  }
-
   private getTunnelSocket(): WebSocket | null {
     const sockets = this.ctx.getWebSockets("client");
 
@@ -386,6 +328,16 @@ export class HostcDurableObject extends DurableObject<Env> {
 
   private sendMessage(socket: WebSocket, message: TunnelServerMessage): void {
     socket.send(JSON.stringify(message));
+  }
+
+  private getTunnelSubdomain(): string {
+    const subdomain = this.ctx.id.name;
+
+    if (!subdomain) {
+      throw new Error("Named Durable Object id is required for tunnel routing");
+    }
+
+    return subdomain;
   }
 }
 
@@ -443,18 +395,6 @@ function isWebSocketUpgrade(request: Request): boolean {
   return request.headers.get("upgrade")?.toLowerCase() === "websocket";
 }
 
-function isCreateTunnelPayload(value: unknown): value is CreateTunnelPayload {
-  return isJsonRecord(value) && isString(value.tunnelId) && isString(value.subdomain);
-}
-
-function isJsonRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function isString(value: unknown): value is string {
-  return typeof value === "string";
-}
-
 function jsonError(message: string, status: number): Response {
   return Response.json(
     {
@@ -510,24 +450,4 @@ function logError(event: string, fields: Record<string, unknown> = {}): void {
       ...fields,
     }),
   );
-}
-
-function generateConnectToken(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return Buffer.from(bytes).toString("hex");
-}
-
-async function tokensMatch(provided: string, expected: string): Promise<boolean> {
-  if (!provided) {
-    return false;
-  }
-
-  const encoder = new TextEncoder();
-  const [providedHash, expectedHash] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(provided)),
-    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
-  ]);
-
-  return timingSafeEqual(Buffer.from(providedHash), Buffer.from(expectedHash));
 }

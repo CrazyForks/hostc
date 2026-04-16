@@ -1,7 +1,7 @@
 import { buildTunnelConnectPath, normalizeSubdomain } from "@hostc/tunnel-protocol";
 
-export function createRandomTunnelId(): string {
-  return `tunnel-${crypto.randomUUID().slice(0, 8)}`;
+export function createRandomSubdomain(): string {
+  return `t-${crypto.randomUUID().slice(0, 8)}`;
 }
 
 export function extractTunnelSubdomain(hostname: string, publicBaseDomain: string): string | null {

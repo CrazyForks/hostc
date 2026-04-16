@@ -23,7 +23,8 @@
 
 - 所有 CLI 逻辑建议集中在 `src/` 下，主入口为 `src/index.ts`。
 - 发布/分发时以 `dist/index.js` 作为 bin 入口。
-- CLI 当前流程为：先调用 Workers API 创建 tunnel，再建立 WebSocket tunnel 连接。
+- CLI 当前流程为：先调用 Workers API 创建 tunnel，随后在内存里持有 session token，定时 refresh，并在 WebSocket 异常断开后自动刷新 connect url 再重连。
+- CLI 当前不暴露自定义 subdomain 参数，公网 subdomain 由 Workers 侧随机分配。
 - 如需扩展命令行参数，建议继续沿用 commander。
 
 ---
