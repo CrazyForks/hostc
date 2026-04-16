@@ -1,0 +1,16 @@
+{
+  "name": "hostc",
+  "private": true,
+  "version": "0.0.0",
+  "main": "./dist/index.js",
+  "bin": {
+    "hostc": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.2"
+  }
+}
