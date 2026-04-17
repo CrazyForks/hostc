@@ -10,6 +10,38 @@ test("parses websocket tunnel server messages", () => {
 	assert.deepStrictEqual(
 		parseTunnelServerMessage(
 			JSON.stringify({
+				type: "tunnel-ready",
+				subdomain: "test",
+				publicUrl: "https://test.example.com",
+			}),
+		),
+		{
+			type: "tunnel-ready",
+			subdomain: "test",
+			publicUrl: "https://test.example.com",
+		},
+	);
+
+	assert.deepStrictEqual(
+		parseTunnelServerMessage(
+			JSON.stringify({
+				type: "tunnel-ready",
+				subdomain: "test",
+				publicUrl: "https://test.example.com",
+				capabilities: ["binary-payload"],
+			}),
+		),
+		{
+			type: "tunnel-ready",
+			subdomain: "test",
+			publicUrl: "https://test.example.com",
+			capabilities: ["binary-payload"],
+		},
+	);
+
+	assert.deepStrictEqual(
+		parseTunnelServerMessage(
+			JSON.stringify({
 				type: "websocket-connect",
 				requestId: "req-1",
 				url: "/socket?room=demo",
@@ -40,6 +72,21 @@ test("parses websocket tunnel server messages", () => {
 			requestId: "req-1",
 			chunk: "aGVsbG8=",
 			isBinary: false,
+		},
+	);
+
+	assert.deepStrictEqual(
+		parseTunnelServerMessage(
+			JSON.stringify({
+				type: "binary-payload",
+				requestId: "req-1",
+				stream: "request-body",
+			}),
+		),
+		{
+			type: "binary-payload",
+			requestId: "req-1",
+			stream: "request-body",
 		},
 	);
 
@@ -89,6 +136,34 @@ test("parses websocket tunnel client messages", () => {
 			type: "websocket-reject",
 			requestId: "req-2",
 			message: "upgrade failed",
+		},
+	);
+
+	assert.deepStrictEqual(
+		parseTunnelClientMessage(
+			JSON.stringify({
+				type: "binary-payload",
+				requestId: "req-2",
+				stream: "response-body",
+			}),
+		),
+		{
+			type: "binary-payload",
+			requestId: "req-2",
+			stream: "response-body",
+		},
+	);
+
+	assert.deepStrictEqual(
+		parseTunnelClientMessage(
+			JSON.stringify({
+				type: "client-capabilities",
+				capabilities: ["binary-payload"],
+			}),
+		),
+		{
+			type: "client-capabilities",
+			capabilities: ["binary-payload"],
 		},
 	);
 
@@ -146,6 +221,39 @@ test("rejects malformed websocket messages", () => {
 				requestId: "req-3",
 				chunk: "AQIDBA==",
 				isBinary: "nope",
+			}),
+		),
+		null,
+	);
+
+	assert.equal(
+		parseTunnelClientMessage(
+			JSON.stringify({
+				type: "binary-payload",
+				requestId: "req-3",
+				stream: "something-else",
+			}),
+		),
+		null,
+	);
+
+	assert.equal(
+		parseTunnelClientMessage(
+			JSON.stringify({
+				type: "client-capabilities",
+				capabilities: "binary-payload",
+			}),
+		),
+		null,
+	);
+
+	assert.equal(
+		parseTunnelServerMessage(
+			JSON.stringify({
+				type: "tunnel-ready",
+				subdomain: "test",
+				publicUrl: "https://test.example.com",
+				capabilities: "binary-payload",
 			}),
 		),
 		null,

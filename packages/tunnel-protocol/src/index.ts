@@ -19,6 +19,7 @@ export type TunnelReadyMessage = {
 	type: "tunnel-ready";
 	subdomain: string;
 	publicUrl: string;
+	capabilities?: string[];
 };
 
 export type ErrorMessage = {
@@ -44,6 +45,22 @@ export type RequestBodyMessage = {
 export type RequestEndMessage = {
 	type: "request-end";
 	requestId: string;
+};
+
+export type BinaryPayloadStream =
+	| "request-body"
+	| "response-body"
+	| "websocket-frame";
+
+export type BinaryPayloadMessage = {
+	type: "binary-payload";
+	requestId: string;
+	stream: BinaryPayloadStream;
+};
+
+export type ClientCapabilitiesMessage = {
+	type: "client-capabilities";
+	capabilities: string[];
 };
 
 export type WebSocketConnectMessage = {
@@ -111,6 +128,7 @@ export type TunnelServerMessage =
 	| ErrorMessage
 	| RequestStartMessage
 	| RequestBodyMessage
+	| BinaryPayloadMessage
 	| RequestEndMessage
 	| WebSocketConnectMessage
 	| WebSocketFrameMessage
@@ -118,8 +136,10 @@ export type TunnelServerMessage =
 
 export type TunnelClientMessage =
 	| ErrorMessage
+	| ClientCapabilitiesMessage
 	| ResponseStartMessage
 	| ResponseBodyMessage
+	| BinaryPayloadMessage
 	| ResponseEndMessage
 	| ResponseErrorMessage
 	| WebSocketAcceptMessage
@@ -215,7 +235,11 @@ function isTunnelServerMessage(
 ): value is TunnelServerMessage {
 	switch (value.type) {
 		case "tunnel-ready":
-			return isString(value.subdomain) && isString(value.publicUrl);
+			return (
+				isString(value.subdomain) &&
+				isString(value.publicUrl) &&
+				(value.capabilities === undefined || isStringArray(value.capabilities))
+			);
 		case "error":
 			return isString(value.message);
 		case "request-start":
@@ -228,6 +252,8 @@ function isTunnelServerMessage(
 			);
 		case "request-body":
 			return isString(value.requestId) && isString(value.chunk);
+		case "binary-payload":
+			return isString(value.requestId) && isBinaryPayloadStream(value.stream);
 		case "request-end":
 			return isString(value.requestId);
 		case "websocket-connect":
@@ -260,6 +286,8 @@ function isTunnelClientMessage(
 	switch (value.type) {
 		case "error":
 			return isString(value.message);
+		case "client-capabilities":
+			return isStringArray(value.capabilities);
 		case "response-start":
 			return (
 				isString(value.requestId) &&
@@ -270,6 +298,8 @@ function isTunnelClientMessage(
 			);
 		case "response-body":
 			return isString(value.requestId) && isString(value.chunk);
+		case "binary-payload":
+			return isString(value.requestId) && isBinaryPayloadStream(value.stream);
 		case "response-end":
 			return isString(value.requestId);
 		case "response-error":
@@ -328,6 +358,14 @@ function isHeaderEntry(value: unknown): value is HeaderEntry {
 
 function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(isString);
+}
+
+function isBinaryPayloadStream(value: unknown): value is BinaryPayloadStream {
+	return (
+		value === "request-body" ||
+		value === "response-body" ||
+		value === "websocket-frame"
+	);
 }
 
 function isJsonRecord(value: unknown): value is JsonRecord {

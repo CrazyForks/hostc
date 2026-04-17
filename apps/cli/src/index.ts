@@ -2,6 +2,7 @@
 
 import type { IncomingMessage } from "node:http";
 import {
+	type BinaryPayloadMessage,
 	buildTunnelRefreshPath,
 	type CreateTunnelResponse,
 	type HeaderEntry,
@@ -604,6 +605,8 @@ async function openTunnelConnection(options: {
 	const localRequests = new Map<string, LocalRequestContext>();
 	const localSockets = new Map<string, LocalWebSocketContext>();
 	let sendQueue = Promise.resolve();
+	let pendingBinaryPayload: BinaryPayloadMessage | null = null;
+	let useBinaryPayload = false;
 	let opened = false;
 	let ready = false;
 
@@ -646,6 +649,7 @@ async function openTunnelConnection(options: {
 				TUNNEL_REPLACED_CLOSE_CODE,
 				"Tunnel connection closed",
 			);
+			pendingBinaryPayload = null;
 			options.registerSocket(null);
 
 			if (options.interrupted()) {
@@ -663,11 +667,37 @@ async function openTunnelConnection(options: {
 		});
 
 		async function handleServerMessage(event: MessageEvent): Promise<void> {
-			const rawMessage = await readMessageText(event.data);
-			const message = parseTunnelServerMessage(rawMessage);
+			const incomingMessage = await readTunnelSocketMessage(event.data);
+
+			if (incomingMessage.kind === "binary") {
+				const binaryPayload = pendingBinaryPayload;
+				pendingBinaryPayload = null;
+
+				if (!binaryPayload) {
+					throw new Error("Received an unexpected binary tunnel payload");
+				}
+
+				handleBinaryPayload(binaryPayload, incomingMessage.payload);
+				return;
+			}
+
+			if (pendingBinaryPayload) {
+				const missingPayload = pendingBinaryPayload;
+				pendingBinaryPayload = null;
+				throw new Error(
+					`Expected a binary payload frame for ${missingPayload.stream} ${missingPayload.requestId}`,
+				);
+			}
+
+			const message = parseTunnelServerMessage(incomingMessage.text);
 
 			if (!message) {
 				throw new Error("Received an invalid tunnel message");
+			}
+
+			if (message.type === "binary-payload") {
+				pendingBinaryPayload = message;
+				return;
 			}
 
 			switch (message.type) {
@@ -675,6 +705,14 @@ async function openTunnelConnection(options: {
 					if (!ready) {
 						ready = true;
 						options.onReady();
+
+						if (message.capabilities?.includes("binary-payload")) {
+							useBinaryPayload = true;
+							queueBackgroundMessage({
+								type: "client-capabilities",
+								capabilities: ["binary-payload"],
+							});
+						}
 
 						if (options.initialConnection) {
 							options.spinner.succeed(
@@ -766,6 +804,33 @@ async function openTunnelConnection(options: {
 			}
 		}
 
+		function handleBinaryPayload(
+			message: BinaryPayloadMessage,
+			payload: Uint8Array,
+		): void {
+			switch (message.stream) {
+				case "request-body": {
+					const requestContext = localRequests.get(message.requestId);
+
+					if (!requestContext?.writer) {
+						return;
+					}
+
+					requestContext.writeChain = requestContext.writeChain.then(() =>
+						requestContext.writer?.write(payload),
+					);
+					return;
+				}
+
+				case "websocket-frame":
+					forwardBinaryFrameToLocalWebSocket(message.requestId, payload);
+					return;
+
+				case "response-body":
+					throw new Error("Received an unexpected binary response payload");
+			}
+		}
+
 		async function startLocalRequest(
 			message: RequestStartMessage,
 		): Promise<void> {
@@ -829,26 +894,49 @@ async function openTunnelConnection(options: {
 							pendingBodyBytes += value.byteLength;
 
 							if (pendingBodyBytes >= HTTP_BODY_BATCH_TARGET_BYTES) {
-								await sendMessage({
-									type: "response-body",
-									requestId: message.requestId,
-									chunk: encodeBase64(
-										concatUint8Arrays(pendingBodyChunks, pendingBodyBytes),
-									),
-								});
+								const batch = concatUint8Arrays(
+									pendingBodyChunks,
+									pendingBodyBytes,
+								);
+
+								if (useBinaryPayload) {
+									await sendBinaryPayload(
+										message.requestId,
+										"response-body",
+										batch,
+									);
+								} else {
+									await sendMessage({
+										type: "response-body",
+										requestId: message.requestId,
+										chunk: encodeBase64(batch),
+									});
+								}
+
 								pendingBodyChunks = [];
 								pendingBodyBytes = 0;
 							}
 						}
 
 						if (pendingBodyBytes > 0) {
-							await sendMessage({
-								type: "response-body",
-								requestId: message.requestId,
-								chunk: encodeBase64(
-									concatUint8Arrays(pendingBodyChunks, pendingBodyBytes),
-								),
-							});
+							const batch = concatUint8Arrays(
+								pendingBodyChunks,
+								pendingBodyBytes,
+							);
+
+							if (useBinaryPayload) {
+								await sendBinaryPayload(
+									message.requestId,
+									"response-body",
+									batch,
+								);
+							} else {
+								await sendMessage({
+									type: "response-body",
+									requestId: message.requestId,
+									chunk: encodeBase64(batch),
+								});
+							}
 						}
 					} finally {
 						reader.releaseLock();
@@ -911,11 +999,29 @@ async function openTunnelConnection(options: {
 			});
 
 			localSocket.on("message", (data: RawData, isBinary: boolean) => {
+				if (isBinary) {
+					if (useBinaryPayload) {
+						queueBackgroundBinaryPayload(
+							message.requestId,
+							"websocket-frame",
+							rawDataToBuffer(data),
+						);
+					} else {
+						queueBackgroundMessage({
+							type: "websocket-frame",
+							requestId: message.requestId,
+							chunk: encodeBase64(rawDataToBuffer(data)),
+							isBinary: true,
+						});
+					}
+					return;
+				}
+
 				queueBackgroundMessage({
 					type: "websocket-frame",
 					requestId: message.requestId,
 					chunk: encodeBase64(rawDataToBuffer(data)),
-					isBinary,
+					isBinary: false,
 				});
 			});
 
@@ -965,6 +1071,11 @@ async function openTunnelConnection(options: {
 			chunk: string,
 			isBinary: boolean,
 		): void {
+			if (isBinary) {
+				forwardBinaryFrameToLocalWebSocket(requestId, decodeBase64(chunk));
+				return;
+			}
+
 			const socketContext = localSockets.get(requestId);
 
 			if (
@@ -975,8 +1086,8 @@ async function openTunnelConnection(options: {
 			}
 
 			socketContext.socket.send(
-				isBinary ? decodeBase64(chunk) : decodeTextBase64(chunk),
-				{ binary: isBinary },
+				decodeTextBase64(chunk),
+				{ binary: false },
 				(error) => {
 					if (!error) {
 						return;
@@ -996,6 +1107,39 @@ async function openTunnelConnection(options: {
 					}
 				},
 			);
+		}
+
+		function forwardBinaryFrameToLocalWebSocket(
+			requestId: string,
+			payload: Uint8Array,
+		): void {
+			const socketContext = localSockets.get(requestId);
+
+			if (
+				!socketContext ||
+				socketContext.socket.readyState !== LocalWebSocket.OPEN
+			) {
+				return;
+			}
+
+			socketContext.socket.send(payload, { binary: true }, (error) => {
+				if (!error) {
+					return;
+				}
+
+				console.error(
+					chalk.yellow(
+						`Failed to forward WebSocket frame for ${requestId}: ${formatError(error)}`,
+					),
+				);
+
+				if (socketContext.socket.readyState === LocalWebSocket.OPEN) {
+					socketContext.socket.close(
+						DEFAULT_WEBSOCKET_CLOSE_CODE,
+						"Failed to forward WebSocket frame",
+					);
+				}
+			});
 		}
 
 		function closeLocalWebSocket(
@@ -1029,17 +1173,52 @@ async function openTunnelConnection(options: {
 			void sendMessage(message).catch(() => undefined);
 		}
 
+		function queueBackgroundBinaryPayload(
+			requestId: string,
+			stream: BinaryPayloadMessage["stream"],
+			payload: Uint8Array,
+		): void {
+			void sendBinaryPayload(requestId, stream, payload).catch(() => undefined);
+		}
+
 		function sendMessage(message: TunnelClientMessage): Promise<void> {
+			return sendSocketFrames([JSON.stringify(message)]);
+		}
+
+		function sendBinaryPayload(
+			requestId: string,
+			stream: BinaryPayloadMessage["stream"],
+			payload: Uint8Array,
+		): Promise<void> {
+			return sendSocketFrames([
+				JSON.stringify({
+					type: "binary-payload",
+					requestId,
+					stream,
+				} satisfies BinaryPayloadMessage),
+				payload,
+			]);
+		}
+
+		function sendSocketFrames(
+			frames: ReadonlyArray<string | Uint8Array>,
+		): Promise<void> {
 			const nextSend = sendQueue
 				.catch(() => undefined)
 				.then(async () => {
-					await waitForTunnelSocketCapacity(tunnelSocket);
+					for (const frame of frames) {
+						await waitForTunnelSocketCapacity(tunnelSocket);
 
-					if (tunnelSocket.readyState !== WebSocket.OPEN) {
-						throw new Error("Tunnel connection is unavailable");
+						if (tunnelSocket.readyState !== WebSocket.OPEN) {
+							throw new Error("Tunnel connection is unavailable");
+						}
+
+						tunnelSocket.send(
+							typeof frame === "string"
+								? frame
+								: (frame as ArrayBufferView<ArrayBuffer>),
+						);
 					}
-
-					tunnelSocket.send(JSON.stringify(message));
 				});
 
 			sendQueue = nextSend;
@@ -1048,23 +1227,42 @@ async function openTunnelConnection(options: {
 	});
 }
 
-async function readMessageText(data: MessageEvent["data"]): Promise<string> {
+async function readTunnelSocketMessage(data: MessageEvent["data"]): Promise<
+	| {
+			kind: "text";
+			text: string;
+	  }
+	| {
+			kind: "binary";
+			payload: Uint8Array;
+	  }
+> {
 	if (typeof data === "string") {
-		return data;
+		return {
+			kind: "text",
+			text: data,
+		};
 	}
 
 	if (data instanceof ArrayBuffer) {
-		return Buffer.from(data).toString("utf8");
+		return {
+			kind: "binary",
+			payload: new Uint8Array(data),
+		};
 	}
 
 	if (ArrayBuffer.isView(data)) {
-		return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString(
-			"utf8",
-		);
+		return {
+			kind: "binary",
+			payload: new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+		};
 	}
 
 	if (data instanceof Blob) {
-		return data.text();
+		return {
+			kind: "binary",
+			payload: new Uint8Array(await data.arrayBuffer()),
+		};
 	}
 
 	throw new Error("Unsupported WebSocket message payload");

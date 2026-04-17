@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { Buffer } from "node:buffer";
 import {
+	type BinaryPayloadMessage,
 	buildPublicUrl,
 	type HeaderEntry,
 	parseTunnelClientMessage,
@@ -85,6 +86,8 @@ export class HostcDurableObject extends DurableObject<Env> {
 	private readonly activeProxySockets = new Map<string, ActiveProxySocket>();
 	private readonly socketSendQueues = new WeakMap<WebSocket, Promise<void>>();
 	private activeControlSocket: WebSocket | null = null;
+	private pendingControlBinaryPayload: BinaryPayloadMessage | null = null;
+	private clientCapabilities = new Set<string>();
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -118,19 +121,72 @@ export class HostcDurableObject extends DurableObject<Env> {
 		}
 
 		if (typeof message !== "string") {
-			logError("tunnel.invalid_frame", {
-				reason: "non_text_frame",
+			const pendingBinaryPayload = this.pendingControlBinaryPayload;
+			this.pendingControlBinaryPayload = null;
+
+			if (!pendingBinaryPayload) {
+				logError("tunnel.invalid_frame", {
+					reason: "unexpected_binary_frame",
+				});
+				ws.close(1003, "Unexpected binary tunnel frame");
+				this.failPendingResponses(
+					new Error("Tunnel closed because of an unexpected binary frame"),
+				);
+				this.failPendingUpgrades(
+					new Error("Tunnel closed because of an unexpected binary frame"),
+				);
+				this.closeActiveProxySockets(
+					TUNNEL_ERROR_CLOSE_CODE,
+					"Tunnel closed because of an unexpected binary frame",
+				);
+				return;
+			}
+
+			try {
+				this.handleBinaryTunnelPayload(
+					pendingBinaryPayload,
+					new Uint8Array(message),
+				);
+			} catch (error) {
+				const errorMessage = asErrorMessage(error);
+
+				logError("tunnel.invalid_binary_payload", {
+					requestId: pendingBinaryPayload.requestId,
+					stream: pendingBinaryPayload.stream,
+					error: errorMessage,
+				});
+				ws.close(1003, "Invalid binary tunnel payload");
+				this.failPendingResponses(
+					new Error("Tunnel closed because of an invalid binary payload"),
+				);
+				this.failPendingUpgrades(
+					new Error("Tunnel closed because of an invalid binary payload"),
+				);
+				this.closeActiveProxySockets(
+					TUNNEL_ERROR_CLOSE_CODE,
+					"Tunnel closed because of an invalid binary payload",
+				);
+			}
+			return;
+		}
+
+		if (this.pendingControlBinaryPayload) {
+			logError("tunnel.invalid_message", {
+				reason: "missing_binary_payload",
+				requestId: this.pendingControlBinaryPayload.requestId,
+				stream: this.pendingControlBinaryPayload.stream,
 			});
-			ws.close(1003, "Tunnel messages must be text frames");
+			this.pendingControlBinaryPayload = null;
+			ws.close(1003, "Expected a binary tunnel payload frame");
 			this.failPendingResponses(
-				new Error("Tunnel closed because of an invalid message frame"),
+				new Error("Tunnel closed because a binary payload frame was missing"),
 			);
 			this.failPendingUpgrades(
-				new Error("Tunnel closed because of an invalid message frame"),
+				new Error("Tunnel closed because a binary payload frame was missing"),
 			);
 			this.closeActiveProxySockets(
 				TUNNEL_ERROR_CLOSE_CODE,
-				"Tunnel closed because of an invalid message frame",
+				"Tunnel closed because a binary payload frame was missing",
 			);
 			return;
 		}
@@ -155,6 +211,11 @@ export class HostcDurableObject extends DurableObject<Env> {
 			return;
 		}
 
+		if (parsedMessage.type === "binary-payload") {
+			this.pendingControlBinaryPayload = parsedMessage;
+			return;
+		}
+
 		this.handleTunnelMessage(parsedMessage);
 	}
 
@@ -171,6 +232,8 @@ export class HostcDurableObject extends DurableObject<Env> {
 		}
 
 		this.clearActiveControlSocket(ws);
+		this.pendingControlBinaryPayload = null;
+		this.clientCapabilities.clear();
 
 		logInfo("tunnel.closed", {
 			code,
@@ -197,6 +260,8 @@ export class HostcDurableObject extends DurableObject<Env> {
 		}
 
 		this.clearActiveControlSocket(ws);
+		this.pendingControlBinaryPayload = null;
+		this.clientCapabilities.clear();
 
 		logError("tunnel.socket_error", {
 			error: message,
@@ -235,6 +300,7 @@ export class HostcDurableObject extends DurableObject<Env> {
 			type: "tunnel-ready",
 			subdomain,
 			publicUrl: buildPublicUrl(this.env.PUBLIC_BASE_DOMAIN, subdomain),
+			capabilities: ["binary-payload"],
 		});
 
 		return new Response(null, {
@@ -301,26 +367,57 @@ export class HostcDurableObject extends DurableObject<Env> {
 						pendingBodyBytes += value.byteLength;
 
 						if (pendingBodyBytes >= HTTP_BODY_BATCH_TARGET_BYTES) {
-							await this.sendMessage(tunnelSocket, {
-								type: "request-body",
-								requestId,
-								chunk: encodeBase64(
-									concatUint8Arrays(pendingBodyChunks, pendingBodyBytes),
-								),
-							});
+							const batch = concatUint8Arrays(
+								pendingBodyChunks,
+								pendingBodyBytes,
+							);
+
+							if (this.clientCapabilities.has("binary-payload")) {
+								await this.sendBinaryPayload(
+									tunnelSocket,
+									{
+										type: "binary-payload",
+										requestId,
+										stream: "request-body",
+									},
+									batch,
+								);
+							} else {
+								await this.sendMessage(tunnelSocket, {
+									type: "request-body",
+									requestId,
+									chunk: encodeBase64(batch),
+								});
+							}
+
 							pendingBodyChunks = [];
 							pendingBodyBytes = 0;
 						}
 					}
 
 					if (pendingBodyBytes > 0) {
-						await this.sendMessage(tunnelSocket, {
-							type: "request-body",
-							requestId,
-							chunk: encodeBase64(
-								concatUint8Arrays(pendingBodyChunks, pendingBodyBytes),
-							),
-						});
+						const batch = concatUint8Arrays(
+							pendingBodyChunks,
+							pendingBodyBytes,
+						);
+
+						if (this.clientCapabilities.has("binary-payload")) {
+							await this.sendBinaryPayload(
+								tunnelSocket,
+								{
+									type: "binary-payload",
+									requestId,
+									stream: "request-body",
+								},
+								batch,
+							);
+						} else {
+							await this.sendMessage(tunnelSocket, {
+								type: "request-body",
+								requestId,
+								chunk: encodeBase64(batch),
+							});
+						}
 					}
 				} finally {
 					reader.releaseLock();
@@ -594,6 +691,13 @@ export class HostcDurableObject extends DurableObject<Env> {
 				return;
 			}
 
+			case "client-capabilities":
+				this.clientCapabilities = new Set(message.capabilities);
+				return;
+
+			case "binary-payload":
+				return;
+
 			case "error":
 				logError("tunnel.client_error", {
 					error: message.message,
@@ -633,15 +737,31 @@ export class HostcDurableObject extends DurableObject<Env> {
 		}
 
 		try {
-			await this.sendMessage(tunnelSocket, {
-				type: "websocket-frame",
-				requestId,
-				chunk:
-					typeof message === "string"
-						? encodeTextBase64(message)
-						: encodeBase64(new Uint8Array(message)),
-				isBinary: typeof message !== "string",
-			});
+			if (typeof message === "string") {
+				await this.sendMessage(tunnelSocket, {
+					type: "websocket-frame",
+					requestId,
+					chunk: encodeTextBase64(message),
+					isBinary: false,
+				});
+			} else if (this.clientCapabilities.has("binary-payload")) {
+				await this.sendBinaryPayload(
+					tunnelSocket,
+					{
+						type: "binary-payload",
+						requestId,
+						stream: "websocket-frame",
+					},
+					new Uint8Array(message),
+				);
+			} else {
+				await this.sendMessage(tunnelSocket, {
+					type: "websocket-frame",
+					requestId,
+					chunk: encodeBase64(new Uint8Array(message as ArrayBuffer)),
+					isBinary: true,
+				});
+			}
 		} catch (error) {
 			logError("proxy.websocket_frame_send_failed", {
 				requestId,
@@ -757,6 +877,8 @@ export class HostcDurableObject extends DurableObject<Env> {
 
 	private disconnectExistingClients(): void {
 		this.activeControlSocket = null;
+		this.pendingControlBinaryPayload = null;
+		this.clientCapabilities.clear();
 
 		for (const socket of this.ctx.getWebSockets(CONTROL_SOCKET_TAG)) {
 			socket.close(
@@ -841,21 +963,85 @@ export class HostcDurableObject extends DurableObject<Env> {
 		socket: WebSocket,
 		message: TunnelServerMessage,
 	): Promise<void> {
+		return this.sendSocketFrames(socket, [JSON.stringify(message)]);
+	}
+
+	private sendBinaryPayload(
+		socket: WebSocket,
+		message: BinaryPayloadMessage,
+		payload: Uint8Array,
+	): Promise<void> {
+		return this.sendSocketFrames(socket, [JSON.stringify(message), payload]);
+	}
+
+	private sendSocketFrames(
+		socket: WebSocket,
+		frames: ReadonlyArray<string | Uint8Array>,
+	): Promise<void> {
 		const previousSend = this.socketSendQueues.get(socket) ?? Promise.resolve();
 		const nextSend = previousSend
 			.catch(() => undefined)
 			.then(async () => {
-				await waitForSocketCapacity(socket);
+				for (const frame of frames) {
+					await waitForSocketCapacity(socket);
 
-				if (socket.readyState !== WebSocket.OPEN) {
-					throw new Error("Tunnel socket is not open");
+					if (socket.readyState !== WebSocket.OPEN) {
+						throw new Error("Tunnel socket is not open");
+					}
+
+					socket.send(frame);
 				}
-
-				socket.send(JSON.stringify(message));
 			});
 
 		this.socketSendQueues.set(socket, nextSend);
 		return nextSend;
+	}
+
+	private handleBinaryTunnelPayload(
+		message: BinaryPayloadMessage,
+		payload: Uint8Array,
+	): void {
+		switch (message.stream) {
+			case "response-body": {
+				const pendingResponse = this.pendingResponses.get(message.requestId);
+
+				if (!pendingResponse?.controller) {
+					return;
+				}
+
+				pendingResponse.controller.enqueue(payload);
+				return;
+			}
+
+			case "websocket-frame": {
+				const activeProxySocket = this.getActiveProxySocket(message.requestId);
+
+				if (!activeProxySocket || !isSocketWritable(activeProxySocket.socket)) {
+					return;
+				}
+
+				try {
+					activeProxySocket.socket.send(payload);
+				} catch (error) {
+					logError("proxy.websocket_frame_forward_failed", {
+						requestId: message.requestId,
+						error: asErrorMessage(error),
+					});
+					activeProxySocket.remoteClosed = true;
+					activeProxySocket.socket.close(
+						TUNNEL_ERROR_CLOSE_CODE,
+						"Failed to forward WebSocket frame",
+					);
+					this.activeProxySockets.delete(message.requestId);
+				}
+				return;
+			}
+
+			case "request-body":
+				throw new Error(
+					"Unexpected binary request body payload from tunnel client",
+				);
+		}
 	}
 
 	private getTunnelSubdomain(): string {
@@ -991,12 +1177,12 @@ function buildProxyRequestTag(requestId: string): string {
 	return `${PROXY_REQUEST_TAG_PREFIX}${requestId}`;
 }
 
-function encodeBase64(bytes: Uint8Array): string {
-	return Buffer.from(bytes).toString("base64");
-}
-
 function encodeTextBase64(value: string): string {
 	return Buffer.from(value, "utf8").toString("base64");
+}
+
+function encodeBase64(value: Uint8Array): string {
+	return Buffer.from(value).toString("base64");
 }
 
 function decodeBase64(value: string): Uint8Array {
