@@ -33,8 +33,8 @@ export default function Waitlist() {
 				Custom subdomains &amp; user accounts.
 			</h1>
 			<p className="text-muted-foreground max-w-sm mb-12 text-base">
-				Persistent tunnels, custom URLs, and team access — leave your email and
-				we'll let you know when it's ready.
+				Persistent tunnels, custom URLs, and team access — leave your email to
+				be the first to get beta access.
 			</p>
 			<WaitlistForm />
 		</div>
@@ -65,30 +65,38 @@ function WaitlistForm() {
 
 	if (status === "success") {
 		return (
-			<p className="text-sm text-muted-foreground">
-				✓ You're on the list. We'll be in touch.
-			</p>
+			<div className="w-full max-w-sm p-4 rounded-md border border-border bg-muted/30 flex flex-col items-center justify-center gap-1">
+				<p className="text-sm font-medium text-foreground">
+					🎉 You're on the list!
+				</p>
+				<p className="text-xs text-muted-foreground">
+					We'll be in touch when it's ready.
+				</p>
+			</div>
 		);
 	}
 
 	return (
 		<form
 			onSubmit={handleSubmit}
-			className="flex flex-col sm:flex-row gap-2 w-full max-w-sm"
+			className="flex flex-col gap-2 w-full max-w-sm"
 		>
-			<Input
-				type="email"
-				placeholder="you@example.com"
-				value={email}
-				onChange={(e) => setEmail(e.target.value)}
-				required
-				className="flex-1"
-			/>
-			<Button type="submit" disabled={status === "loading"}>
-				{status === "loading" ? "Joining…" : "Join Waitlist"}
-			</Button>
+			<div className="flex flex-col sm:flex-row gap-2 w-full">
+				<Input
+					type="email"
+					placeholder="you@example.com"
+					value={email}
+					onChange={(e) => setEmail(e.target.value)}
+					required
+					disabled={status === "loading"}
+					className="flex-1"
+				/>
+				<Button type="submit" disabled={status === "loading"}>
+					{status === "loading" ? "Joining…" : "Join Waitlist"}
+				</Button>
+			</div>
 			{status === "error" && (
-				<p className="text-xs text-destructive mt-1 w-full">
+				<p className="text-xs text-destructive text-left px-1">
 					Something went wrong. Please try again.
 				</p>
 			)}
