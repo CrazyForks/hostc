@@ -4,7 +4,6 @@
 		"module": "NodeNext",
 		"moduleResolution": "NodeNext",
 		"ignoreDeprecations": "6.0",
-		"baseUrl": ".",
 		"paths": {
 			"@hostc/tunnel-protocol": ["../../packages/tunnel-protocol/src/index.ts"]
 		},
